@@ -1,497 +1,628 @@
 #!/usr/bin/env python3
-"""World news of Monday 23 November 2026, summed up in one image.
+"""World news, 23 November 2026, drawn as one newspaper front page.
 
-A pure-stdlib Python program (no third-party packages, no network): it
-draws a one-page newspaper front page -- masthead, lead story and six
-further stories from 23 November 2026 -- onto a 1024x1024 canvas with a
-small built-in 5x7 bitmap font, and writes it as a PNG to
-$MAKEFUN_OUTPUT_DIR/entry.png (or /output/entry.png).
+Pure standard library. Deterministic: same input always yields the same
+bytes. No network, no clock, no randomness.
 
-The run is fully deterministic: the same bytes come out every time.
+Run:  python3 main.py
+Out:  world-news-23-nov-2026.png  (1024x1024, RGB, under 1 MiB)
 
-Run locally:
-    mkdir -p out && MAKEFUN_OUTPUT_DIR=out python3 main.py
+Design, in brief: a scanline Board (one bytearray per row) is painted with
+a small set of raster primitives (rectangles, Bresenham strokes, midpoint
+circles). All lettering uses a hand-built vector stroke font: every glyph
+is a list of polylines on a 7-by-11 unit grid, scaled by integer factors.
+Six news tiles and one lead story are laid out by a tiny box model that
+measures text before it places it, so nothing can overflow the page.
 """
 
-import math
-import os
+import hashlib
 import struct
+import sys
 import zlib
 
-W, H = 1024, 1024
+WIDTH = 1024
+HEIGHT = 1024
+OUT_PATH = "world-news-23-nov-2026.png"
 
-# ---------------------------------------------------------------- palette
-PAPER = (247, 243, 232)   # warm newsprint
-INK = (20, 20, 20)        # near-black text
-NAVY = (15, 42, 74)       # masthead band
-NAVY_LT = (28, 68, 110)
-RED = (179, 39, 30)       # lead accent
-GOLD = (201, 162, 39)
-WHITE = (255, 255, 255)
-GREY = (90, 88, 80)
-LINE = (190, 184, 168)
-TEAL = (14, 110, 105)
-MAROON = (122, 28, 48)
-GREEN = (46, 110, 44)
-SLATE = (70, 84, 102)
-BROWN = (120, 72, 32)
-
-# ------------------------------------------------------- 5x7 bitmap font
-# Each glyph is 7 strings of 5 cells; '#' is ink, '.' is blank.
-# Only capitals, digits and common punctuation: all copy is set in caps.
-FONT = {
-    "A": ("01110", "10001", "10001", "11111", "10001", "10001", "10001"),
-    "B": ("11110", "10001", "10001", "11110", "10001", "10001", "11110"),
-    "C": ("01110", "10001", "10000", "10000", "10000", "10001", "01110"),
-    "D": ("11110", "10001", "10001", "10001", "10001", "10001", "11110"),
-    "E": ("11111", "10000", "10000", "11110", "10000", "10000", "11111"),
-    "F": ("11111", "10000", "10000", "11110", "10000", "10000", "10000"),
-    "G": ("01110", "10001", "10000", "10111", "10001", "10001", "01111"),
-    "H": ("10001", "10001", "10001", "11111", "10001", "10001", "10001"),
-    "I": ("01110", "00100", "00100", "00100", "00100", "00100", "01110"),
-    "J": ("00111", "00010", "00010", "00010", "00010", "10010", "01100"),
-    "K": ("10001", "10010", "10100", "11000", "10100", "10010", "10001"),
-    "L": ("10000", "10000", "10000", "10000", "10000", "10000", "11111"),
-    "M": ("10001", "11011", "10101", "10101", "10001", "10001", "10001"),
-    "N": ("10001", "11001", "10101", "10011", "10001", "10001", "10001"),
-    "O": ("01110", "10001", "10001", "10001", "10001", "10001", "01110"),
-    "P": ("11110", "10001", "10001", "11110", "10000", "10000", "10000"),
-    "Q": ("01110", "10001", "10001", "10001", "10101", "10010", "01101"),
-    "R": ("11110", "10001", "10001", "11110", "10100", "10010", "10001"),
-    "S": ("01111", "10000", "10000", "01110", "00001", "00001", "11110"),
-    "T": ("11111", "00100", "00100", "00100", "00100", "00100", "00100"),
-    "U": ("10001", "10001", "10001", "10001", "10001", "10001", "01110"),
-    "V": ("10001", "10001", "10001", "10001", "10001", "01010", "00100"),
-    "W": ("10001", "10001", "10001", "10101", "10101", "11011", "10001"),
-    "X": ("10001", "10001", "01010", "00100", "01010", "10001", "10001"),
-    "Y": ("10001", "10001", "01010", "00100", "00100", "00100", "00100"),
-    "Z": ("11111", "00001", "00010", "00100", "01000", "10000", "11111"),
-    "0": ("01110", "10001", "10011", "10101", "11001", "10001", "01110"),
-    "1": ("00100", "01100", "00100", "00100", "00100", "00100", "01110"),
-    "2": ("01110", "10001", "00001", "00010", "00100", "01000", "11111"),
-    "3": ("11111", "00010", "00100", "00010", "00001", "10001", "01110"),
-    "4": ("00010", "00110", "01010", "10010", "11111", "00010", "00010"),
-    "5": ("11111", "10000", "11110", "00001", "00001", "10001", "01110"),
-    "6": ("00110", "01000", "10000", "11110", "10001", "10001", "01110"),
-    "7": ("11111", "00001", "00010", "00100", "01000", "01000", "01000"),
-    "8": ("01110", "10001", "10001", "01110", "10001", "10001", "01110"),
-    "9": ("01110", "10001", "10001", "01111", "00001", "00010", "01100"),
-    " ": (".....", ".....", ".....", ".....", ".....", ".....", "....."),
-    ".": (".....", ".....", ".....", ".....", ".....", ".##..", ".##.."),
-    ",": (".....", ".....", ".....", ".....", ".##..", "..#..", ".#..."),
-    "-": (".....", ".....", ".....", "#####", ".....", ".....", "....."),
-    "'": ("..#..", "..#..", ".#...", ".....", ".....", ".....", "....."),
-    "!": ("..#..", "..#..", "..#..", "..#..", "..#..", ".....", "..#.."),
-    "?": ("01110", "10001", "00001", "00010", "00100", ".....", "00100"),
-    "%": ("11001", "11001", "00010", "00100", "01000", "10011", "10011"),
-    "(": ("...#.", "..#..", ".#...", ".#...", ".#...", "..#..", "...#."),
-    ")": (".#...", "..#..", "...#.", "...#.", "...#.", "..#..", ".#..."),
-    "/": ("....#", "....#", "...#.", "..#..", ".#...", "#....", "#...."),
-    "$": ("..#..", ".####", "#.#..", ".###.", "..#.#", "####.", "..#.."),
-    "+": (".....", "..#..", "..#..", ".###.", "..#..", "..#..", "....."),
-    "=": (".....", ".....", "#####", ".....", "#####", ".....", "....."),
-    ":": (".....", ".##..", ".##..", ".....", ".##..", ".##..", "....."),
-    ";": (".....", ".##..", ".##..", ".....", ".##..", "..#..", ".#..."),
-    '"': (".#.#.", ".#.#.", ".#.#.", ".....", ".....", ".....", "....."),
-    "*": (".....", "..#..", "#.#.#", ".###.", "#.#.#", "..#..", "....."),
-    "&": (".##..", "#..#.", "#.#..", ".#...", "#.#.#", "#..#.", ".##.#"),
-    "<": ("...#.", "..#..", ".#...", "#....", ".#...", "..#..", "...#."),
-    ">": (".#...", "..#..", "...#.", "....#", "...#.", "..#..", ".#..."),
-    "#": (".#.#.", ".#.#.", "#####", ".#.#.", "#####", ".#.#.", ".#.#."),
-    "_": (".....", ".....", ".....", ".....", ".....", ".....", "#####"),
-}
+# Palette: warm newsprint paper, near-black ink, signal red, deep blue.
+PAPER = (250, 246, 238)
+INK = (18, 18, 18)
+RED = (178, 32, 44)
+BLUE = (29, 78, 137)
+GREY = (105, 105, 100)
+LIGHT = (232, 226, 214)
 
 
-def glyph_rows(ch):
-    """Return the 7-row bitmap for a character, upper-cased, or '?'."""
-    return FONT.get(ch.upper(), FONT["?"])
+class Board:
+    """An RGB picture kept as one bytearray per scanline.
 
+    Rows are independent buffers, so a horizontal fill is a single slice
+    assignment and a vertical rule is a short loop over rows.
+    """
 
-# ------------------------------------------------------------------ canvas
-class Canvas:
-    """An RGB canvas backed by one flat bytearray (fast slice fills)."""
+    def __init__(self, width, height, paper):
+        self.width = width
+        self.height = height
+        self.rows = []
+        fill = bytes(paper) * width
+        for _ in range(height):
+            self.rows.append(bytearray(fill))
 
-    def __init__(self, w, h, bg):
-        self.w, self.h = w, h
-        self.buf = bytearray(bytes(bg) * (w * h))
+    def dot(self, x, y, rgb):
+        if 0 <= x < self.width and 0 <= y < self.height:
+            row = self.rows[y]
+            i = x * 3
+            row[i] = rgb[0]
+            row[i + 1] = rgb[1]
+            row[i + 2] = rgb[2]
 
-    def _idx(self, x, y):
-        return (y * self.w + x) * 3
+    def brush(self, x, y, size, rgb):
+        """A square brush centred on (x, y); size 1 is a single pixel."""
+        half = size // 2
+        for dy in range(-half, size - half):
+            for dx in range(-half, size - half):
+                self.dot(x + dx, y + dy, rgb)
 
-    def rect(self, x, y, w, h, color):
-        x0, y0 = max(0, x), max(0, y)
-        x1, y1 = min(self.w, x + w), min(self.h, y + h)
-        if x1 <= x0 or y1 <= y0:
+    def hline(self, x0, x1, y, rgb, thick=1):
+        if x1 < x0:
+            x0, x1 = x1, x0
+        x0 = max(0, x0)
+        x1 = min(self.width - 1, x1)
+        if x0 > x1:
             return
-        fill = bytes(color) * (x1 - x0)
+        span = bytes(rgb) * (x1 - x0 + 1)
+        for yy in range(y, y + thick):
+            if 0 <= yy < self.height:
+                self.rows[yy][x0 * 3:(x1 + 1) * 3] = span
+
+    def vline(self, x, y0, y1, rgb, thick=1):
+        if y1 < y0:
+            y0, y1 = y1, y0
+        for xx in range(x, x + thick):
+            if 0 <= xx < self.width:
+                for yy in range(max(0, y0), min(self.height, y1 + 1)):
+                    row = self.rows[yy]
+                    i = xx * 3
+                    row[i] = rgb[0]
+                    row[i + 1] = rgb[1]
+                    row[i + 2] = rgb[2]
+
+    def fill_rect(self, x, y, w, h, rgb):
+        if w <= 0 or h <= 0:
+            return
+        x0 = max(0, x)
+        x1 = min(self.width, x + w)
+        y0 = max(0, y)
+        y1 = min(self.height, y + h)
+        if x0 >= x1 or y0 >= y1:
+            return
+        span = bytes(rgb) * (x1 - x0)
         for yy in range(y0, y1):
-            i = self._idx(x0, yy)
-            self.buf[i:i + (x1 - x0) * 3] = fill
+            self.rows[yy][x0 * 3:x1 * 3] = span
 
-    def hline(self, x, y, w, color, t=1):
-        self.rect(x, y, w, t, color)
+    def frame(self, x, y, w, h, rgb, thick=1):
+        self.hline(x, x + w - 1, y, rgb, thick)
+        self.hline(x, x + w - 1, y + h - thick, rgb, thick)
+        self.vline(x, y, y + h - 1, rgb, thick)
+        self.vline(x + w - thick, y, y + h - 1, rgb, thick)
 
-    def vline(self, x, y, h, color, t=1):
-        self.rect(x, y, t, h, color)
-
-    def frame(self, x, y, w, h, color, t=2):
-        self.rect(x, y, w, t, color)
-        self.rect(x, y + h - t, w, t, color)
-        self.rect(x, y, t, h, color)
-        self.rect(x + w - t, y, t, h, color)
-
-    def disc(self, cx, cy, r, color):
-        """Filled circle by scanlines."""
-        for dy in range(-r, r + 1):
-            dx = int((r * r - dy * dy) ** 0.5)
-            self.rect(cx - dx, cy + dy, dx * 2 + 1, 1, color)
-
-    def ring(self, cx, cy, r, color, t=3):
-        for dy in range(-r, r + 1):
-            dx = int((r * r - dy * dy) ** 0.5)
-            inner = 0
-            if abs(dy) < r - t:
-                inner = int(max(0, (r - t) * (r - t) - dy * dy) ** 0.5)
-            self.rect(cx - dx, cy + dy, dx - inner, 1, color)
-            self.rect(cx + inner + 1, cy + dy, dx - inner, 1, color)
-
-    def line(self, x0, y0, x1, y1, color, t=1):
-        """Bresenham line, optionally thickened to t pixels."""
-        dx, dy = abs(x1 - x0), abs(y1 - y0)
+    def line(self, x0, y0, x1, y1, rgb, thick=1):
+        """Bresenham segment, painted with the square brush."""
+        dx = abs(x1 - x0)
+        dy = -abs(y1 - y0)
         sx = 1 if x0 < x1 else -1
         sy = 1 if y0 < y1 else -1
-        err = dx - dy
+        err = dx + dy
         x, y = x0, y0
         while True:
-            self.rect(x - t // 2, y - t // 2, t, t, color)
+            self.brush(x, y, thick, rgb)
             if x == x1 and y == y1:
                 return
             e2 = 2 * err
-            if e2 > -dy:
-                err -= dy
+            if e2 >= dy:
+                err += dy
                 x += sx
-            if e2 < dx:
+            if e2 <= dx:
                 err += dx
                 y += sy
 
-    def tri(self, x0, y0, x1, y1, x2, y2, color):
-        """Filled triangle by scanline fill between its edges."""
-        pts = sorted(((x0, y0), (x1, y1), (x2, y2)), key=lambda p: p[1])
-        (ax, ay), (bx, by), (cx, cy) = pts
-        edges = (((ax, ay), (bx, by)), ((bx, by), (cx, cy)),
-                 ((ax, ay), (cx, cy)))
-        for y in range(ay, cy + 1):
-            xs = []
-            for (px0, py0), (px1, py1) in edges:
-                if py0 <= y <= py1 and py1 != py0:
-                    xs.append(px0 + (px1 - px0) * (y - py0) / (py1 - py0))
-                elif y == py0 == py1:
-                    xs.extend((px0, px1))
-            if len(xs) >= 2:
-                xa, xb = int(min(xs)), int(max(xs))
-                self.rect(xa, y, xb - xa + 1, 1, color)
-
-    # ------------------------------------------------------------ text
-    def text(self, x, y, s, color, scale=2):
-        """Draw upper-cased text; returns the x just past the last glyph."""
-        cx = x
-        for ch in s:
-            rows = glyph_rows(ch)
-            for ry, row in enumerate(rows):
-                yy = y + ry * scale
-                for bx, cell in enumerate(row):
-                    if cell == "1" or cell == "#":
-                        self.rect(cx + bx * scale, yy, scale, scale, color)
-            cx += 6 * scale
-        return cx
-
-    def text_w(self, s, scale=2):
-        return len(s) * 6 * scale - scale
-
-    def text_center(self, cx, y, s, color, scale=2):
-        self.text(cx - self.text_w(s, scale) // 2, y, s, color, scale)
-
-    def wrap(self, s, max_w, scale=2):
-        """Greedy word wrap; returns a list of lines fitting max_w pixels."""
-        lines, cur = [], ""
-        for word in s.split(" "):
-            trial = (cur + " " + word).strip()
-            if self.text_w(trial, scale) <= max_w or not cur:
-                cur = trial
+    def circle(self, cx, cy, r, rgb, thick=1):
+        """Midpoint circle outline."""
+        x = 0
+        y = r
+        d = 1 - r
+        while x <= y:
+            for px, py in (
+                (cx + x, cy + y), (cx + y, cy + x), (cx - x, cy + y),
+                (cx - y, cy + x), (cx + x, cy - y), (cx + y, cy - x),
+                (cx - x, cy - y), (cx - y, cy - x),
+            ):
+                self.brush(px, py, thick, rgb)
+            if d < 0:
+                d += 2 * x + 3
             else:
-                lines.append(cur)
-                cur = word
-        if cur:
-            lines.append(cur)
-        return lines
+                d += 2 * (x - y) + 5
+                y -= 1
+            x += 1
 
-    def para(self, x, y, s, color, max_w, scale=2, leading=4, max_lines=None):
-        lines = self.wrap(s, max_w, scale)
-        if max_lines is not None:
-            lines = lines[:max_lines]
-        for i, ln in enumerate(lines):
-            self.text(x, y + i * (7 * scale + leading), ln, color, scale)
-        return y + len(lines) * (7 * scale + leading)
+    def disc(self, cx, cy, r, rgb):
+        """Filled circle, painted one scanline at a time."""
+        for yy in range(cy - r, cy + r + 1):
+            half = int((r * r - (yy - cy) * (yy - cy)) ** 0.5)
+            self.hline(cx - half, cx + half, yy, rgb)
 
+    def png_bytes(self):
+        """Encode the board as a PNG (8-bit RGB, filter 0 per row)."""
+        raw = bytearray()
+        for row in self.rows:
+            raw.append(0)
+            raw += row
+        body = struct.pack(">IIBBBBB", WIDTH, HEIGHT, 8, 2, 0, 0, 0)
+        out = bytearray(b"\x89PNG\r\n\x1a\n")
+        out += self._chunk(b"IHDR", body)
+        out += self._chunk(b"IDAT", zlib.compress(bytes(raw), 9))
+        out += self._chunk(b"IEND", b"")
+        return bytes(out)
 
-# ------------------------------------------------------------- PNG writer
-def _chunk(kind, data):
-    out = struct.pack(">I", len(data)) + kind + data
-    return out + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
-
-
-def write_png(path, canvas):
-    raw = bytearray()
-    stride = canvas.w * 3
-    for yy in range(canvas.h):
-        raw.append(0)  # filter: none
-        raw += canvas.buf[yy * stride:(yy + 1) * stride]
-    ihdr = struct.pack(">IIBBBBB", canvas.w, canvas.h, 8, 2, 0, 0, 0)
-    png = b"\x89PNG\r\n\x1a\n"
-    png += _chunk(b"IHDR", ihdr)
-    png += _chunk(b"IDAT", zlib.compress(bytes(raw), 9))
-    png += _chunk(b"IEND", b"")
-    with open(path, "wb") as fh:
-        fh.write(png)
-    return len(png)
+    @staticmethod
+    def _chunk(kind, payload):
+        data = kind + payload
+        return struct.pack(">I", len(payload)) + data + struct.pack(
+            ">I", zlib.crc32(data) & 0xFFFFFFFF
+        )
 
 
-# ------------------------------------------------------------- pictograms
-# Small flat icons drawn from primitives, one per story, in a square box.
+# ---------------------------------------------------------------------------
+# Stroke font
+#
+# Each glyph is a tuple of strokes. A stroke is a space-separated list of
+# "x,y" knots on a 7-wide, 11-tall unit grid (x 0..6, y 0..10; the text
+# baseline sits at y 9, descenders reach y 10). The renderer joins the
+# knots with straight segments and scales everything by an integer factor.
+# Only capitals are drawn: callers uppercase their text first.
+# ---------------------------------------------------------------------------
 
-def icon_explosion(cv, x, y, s, c1, c2):
-    """Blast starburst: triangles radiating from a bright core."""
-    cx, cy = x + s // 2, y + s // 2
-    for k in range(8):
-        ang = k * math.pi / 4
-        ex = int(cx + (s * 0.52) * math.cos(ang))
-        ey = int(cy + (s * 0.52) * math.sin(ang))
-        px = int(cx + (s * 0.16) * math.cos(ang + 0.5))
-        py = int(cy + (s * 0.16) * math.sin(ang + 0.5))
-        qx = int(cx + (s * 0.16) * math.cos(ang - 0.5))
-        qy = int(cy + (s * 0.16) * math.sin(ang - 0.5))
-        cv.tri(ex, ey, px, py, qx, qy, c1)
-    cv.disc(cx, cy, s // 5, c2)
+def _strokes(*rows):
+    return tuple(tuple(_knot(tok) for tok in row.split()) for row in rows)
 
 
-def icon_globe(cv, x, y, s, c1, c2):
-    cx, cy = x + s // 2, y + s // 2
-    r = s // 2 - 2
-    cv.disc(cx, cy, r, c1)
-    cv.ring(cx, cy, r, c2, 3)
-    cv.hline(cx - r, cy, 2 * r, c2, 3)
-    cv.vline(cx, cy - r, 2 * r, c2, 3)
-    cv.line(cx - r + 4, cy - r + 8, cx + r - 4, cy + r - 8, c2, 3)
-    cv.line(cx - r + 4, cy + r - 8, cx + r - 4, cy - r + 8, c2, 3)
+def _knot(tok):
+    a, b = tok.split(",")
+    return (int(a), int(b))
 
 
-def icon_scales(cv, x, y, s, c1, c2):
-    cx, cy = x + s // 2, y + s // 2
-    cv.vline(cx, y + s // 8, s * 3 // 4, c1, 4)
-    cv.hline(cx - s // 3, y + s // 8, s * 2 // 3, c1, 4)
-    cv.disc(cx, y + s // 8, s // 12, c2)
-    cv.disc(cx, y + s * 7 // 8, s // 10, c1)
-    for sx in (cx - s // 3, cx + s // 3):
-        cv.line(sx, y + s // 8, sx, y + s // 2, c1, 3)
-        cv.tri(sx - s // 7, y + s // 2, sx + s // 7, y + s // 2,
-               sx, y + s * 5 // 8, c2)
-        cv.hline(sx - s // 7, y + s // 2, s * 2 // 7, c2, 3)
+GLYPHS = {
+    "A": _strokes("0,9 3,0 6,9", "1,6 5,6"),
+    "B": _strokes("0,0 0,9", "0,0 4,0 6,2 4,4 0,4",
+                  "0,4 4,4 6,6 4,9 0,9"),
+    "C": _strokes("6,2 4,0 2,0 0,2 0,7 2,9 4,9 6,7"),
+    "D": _strokes("0,0 0,9", "0,0 4,0 6,2 6,7 4,9 0,9"),
+    "E": _strokes("6,0 0,0 0,9 6,9", "0,4 4,4"),
+    "F": _strokes("6,0 0,0 0,9", "0,4 4,4"),
+    "G": _strokes("6,2 4,0 2,0 0,2 0,7 2,9 4,9 6,7 6,5 3,5"),
+    "H": _strokes("0,0 0,9", "6,0 6,9", "0,4 6,4"),
+    "I": _strokes("0,0 6,0", "3,0 3,9", "0,9 6,9"),
+    "J": _strokes("6,0 6,7 4,9 2,9 0,7"),
+    "K": _strokes("0,0 0,9", "6,0 0,4", "1,5 6,9"),
+    "L": _strokes("0,0 0,9 6,9"),
+    "M": _strokes("0,9 0,0 3,5 6,0 6,9"),
+    "N": _strokes("0,9 0,0 6,9 6,0"),
+    "O": _strokes("2,0 4,0 6,2 6,7 4,9 2,9 0,7 0,2 2,0"),
+    "P": _strokes("0,9 0,0 4,0 6,2 4,4 0,4"),
+    "Q": _strokes("2,0 4,0 6,2 6,7 4,9 2,9 0,7 0,2 2,0", "4,7 6,9"),
+    "R": _strokes("0,9 0,0 4,0 6,2 4,4 0,4", "2,4 6,9"),
+    "S": _strokes("5,0 2,0 0,2 0,4 2,5 5,5 6,7 6,8 5,9 2,9 0,8"),
+    "T": _strokes("0,0 6,0", "3,0 3,9"),
+    "U": _strokes("0,0 0,7 2,9 4,9 6,7 6,0"),
+    "V": _strokes("0,0 3,9 6,0"),
+    "W": _strokes("0,0 1,9 3,5 5,9 6,0"),
+    "X": _strokes("0,0 6,9", "6,0 0,9"),
+    "Y": _strokes("0,0 3,4 6,0", "3,4 3,9"),
+    "Z": _strokes("0,0 6,0 0,9 6,9"),
+    "0": _strokes("2,0 4,0 6,2 6,7 4,9 2,9 0,7 0,2 2,0", "1,2 5,7"),
+    "1": _strokes("2,1 3,0 3,9", "0,9 6,9"),
+    "2": _strokes("0,1 2,0 4,0 6,2 6,4 0,9 6,9"),
+    "3": _strokes("0,1 2,0 4,0 6,2 4,4", "4,4 6,6 6,8 4,9 2,9 0,8"),
+    "4": _strokes("4,0 4,9", "6,0 0,6 6,6"),
+    "5": _strokes("6,0 0,0 0,4 4,4 6,6 6,8 4,9 0,9"),
+    "6": _strokes("6,1 4,0 2,0 0,2 0,7 2,9 4,9 6,7 6,5 4,4 2,4 0,5"),
+    "7": _strokes("0,0 6,0 3,9"),
+    "8": _strokes("2,0 4,0 6,2 4,4 2,4 0,2 2,0",
+                  "2,4 4,4 6,6 6,8 4,9 2,9 0,7 0,5 2,4"),
+    "9": _strokes("2,0 4,0 6,2 6,5 4,7 2,7 0,5 0,2 2,0",
+                  "6,5 6,8 4,9 2,9 0,8"),
+    " ": (),
+    ".": _strokes("2,8 4,8 4,9 2,9"),
+    ",": _strokes("2,7 4,7 4,9 2,9", "3,9 1,10"),
+    ":": _strokes("2,2 4,2 4,3 2,3", "2,6 4,6 4,7 2,7"),
+    ";": _strokes("2,2 4,2 4,3 2,3", "2,6 4,6 4,7 2,7 1,10"),
+    "-": _strokes("1,5 5,5"),
+    "/": _strokes("0,9 6,0"),
+    "(": _strokes("5,0 3,2 3,7 5,9"),
+    ")": _strokes("1,0 3,2 3,7 1,9"),
+    "%": _strokes("6,0 0,9", "1,1 3,1 3,3 1,3 1,1",
+                  "3,6 5,6 5,8 3,8 3,6"),
+    "+": _strokes("3,1 3,8", "0,4 6,4"),
+    "!": _strokes("3,0 3,6", "2,8 4,8 4,9 2,9"),
+    "?": _strokes("1,1 2,0 4,0 5,1 5,3 3,5 3,6", "2,8 4,8 4,9 2,9"),
+    "'": _strokes("3,0 3,2"),
+    '"': _strokes("2,0 2,2", "4,0 4,2"),
+    "=": _strokes("0,3 6,3", "0,6 6,6"),
+    "*": _strokes("3,0 3,9", "0,2 6,7", "6,2 0,7"),
+    "_": _strokes("0,9 6,9"),
+}
+
+CELL_W = 8   # advance per character, in font units
+CELL_H = 11  # glyph cell height, in font units
 
 
-def icon_leaf(cv, x, y, s, c1, c2):
-    cx, cy = x + s // 2, y + s // 2
-    cv.tri(cx, y + 4, cx + s // 3, cy, cx, y + s - 10, c1)
-    cv.tri(cx, y + 4, cx - s // 3, cy, cx, y + s - 10, c1)
-    cv.vline(cx, y + 8, s - 18, GOLD, 3)
-    cv.line(cx, y + s - 10, cx + s // 4, y + s - 2, c1, 4)
+def text_width(text, scale):
+    """Pixel width of text drawn at the given integer scale."""
+    return len(text) * CELL_W * scale
 
 
-def icon_chart(cv, x, y, s, c1, c2):
-    base = y + s * 3 // 4
-    bw = s // 6
-    heights = (s // 4, s // 2, s * 5 // 12, s // 6)
-    for i, hh in enumerate(heights):
-        cv.rect(x + 4 + i * (bw + 4), base - hh, bw, hh, c1)
-    cv.line(x + 2, y + s // 6, x + s - 4, y + s // 2, c2, 5)
-    cv.tri(x + s - 4, y + s // 2, x + s - 14, y + s // 2 - 8,
-           x + s - 14, y + s // 2 + 8, c2)
+def draw_text(board, x, y, text, scale, rgb):
+    """Draw uppercased text; (x, y) is the top-left of the first cell."""
+    thick = max(1, scale // 2)
+    cx = x
+    for ch in text.upper():
+        for stroke in GLYPHS.get(ch, ()):
+            prev = None
+            for gx, gy in stroke:
+                px = cx + gx * scale
+                py = y + gy * scale
+                if prev is not None:
+                    board.line(prev[0], prev[1], px, py, rgb, thick)
+                else:
+                    board.brush(px, py, thick, rgb)
+                prev = (px, py)
+        cx += CELL_W * scale
 
 
-def icon_badge(cv, x, y, s, c1, c2):
-    cx, cy = x + s // 2, y + s // 2
-    cv.disc(cx, cy, s // 3, c1)
-    cv.ring(cx, cy, s // 3, c2, 3)
-    cv.line(cx - s // 6, cy, cx - s // 18, cy + s // 6, WHITE, 5)
-    cv.line(cx - s // 18, cy + s // 6, cx + s // 5, cy - s // 6, WHITE, 5)
+def draw_centred(board, cx, y, text, scale, rgb):
+    draw_text(board, cx - text_width(text, scale) // 2, y, text, scale, rgb)
 
 
-def icon_rocket(cv, x, y, s, c1, c2):
-    cx = x + s // 2
-    cv.tri(cx, y + 2, cx - s // 6, y + s // 2, cx + s // 6, y + s // 2, c1)
-    cv.rect(cx - s // 6, y + s // 2, s // 3, s // 4, c1)
-    cv.tri(cx - s // 6, y + s // 2, cx - s // 3, y + s * 3 // 4,
-           cx - s // 6, y + s * 3 // 4, c2)
-    cv.tri(cx + s // 6, y + s // 2, cx + s // 3, y + s * 3 // 4,
-           cx + s // 6, y + s * 3 // 4, c2)
-    cv.tri(cx, y + s, cx - s // 8, y + s * 3 // 4, cx + s // 8, y + s * 3 // 4, GOLD)
+def wrap_text(text, scale, max_width):
+    """Greedy word wrap; returns a list of lines that fit max_width."""
+    lines = []
+    for paragraph in text.split("\n"):
+        words = paragraph.split()
+        if not words:
+            lines.append("")
+            continue
+        current = words[0]
+        for word in words[1:]:
+            trial = current + " " + word
+            if text_width(trial, scale) <= max_width:
+                current = trial
+            else:
+                lines.append(current)
+                current = word
+        lines.append(current)
+    return lines
 
 
-ICONS = {
-    "explosion": icon_explosion,
-    "globe": icon_globe,
-    "scales": icon_scales,
-    "leaf": icon_leaf,
-    "chart": icon_chart,
-    "badge": icon_badge,
-    "rocket": icon_rocket,
+# ---------------------------------------------------------------------------
+# Motifs: small line-drawn icons, one per story. Each takes the board, the
+# top-left of its box, the box size, and a colour. All geometry is derived
+# from the box so the same motif works at any size.
+# ---------------------------------------------------------------------------
+
+def motif_burst(board, x, y, size, rgb):
+    """Starburst: a ring with twelve radiating spikes, for the lead story."""
+    cx, cy = x + size // 2, y + size // 2
+    board.circle(cx, cy, size // 5, rgb, 3)
+    board.disc(cx, cy, size // 12, rgb)
+    for k in range(12):
+        # 30-degree steps, alternating long and short spikes.
+        angle = k * 30
+        long = size // 2 - 4
+        short = size // 3
+        reach = long if k % 2 == 0 else short
+        # Integer trig via a tiny lookup: cos/sin of multiples of 30 deg.
+        table = [(100, 0), (87, 50), (50, 87), (0, 100), (-50, 87),
+                 (-87, 50), (-100, 0), (-87, -50), (-50, -87), (0, -100),
+                 (50, -87), (87, -50)]
+        c, s = table[k]
+        x1 = cx + c * (size // 5 + 2) // 100
+        y1 = cy + s * (size // 5 + 2) // 100
+        x2 = cx + c * reach // 100
+        y2 = cy + s * reach // 100
+        board.line(x1, y1, x2, y2, rgb, 3)
+        _ = angle
+
+
+def motif_drone(board, x, y, size, rgb):
+    """Quadcopter seen from above: body, four arms, four rotors."""
+    cx, cy = x + size // 2, y + size // 2
+    arm = size // 3
+    board.fill_rect(cx - size // 10, cy - size // 10, size // 5, size // 5,
+                    rgb)
+    for dx, dy in ((-1, -1), (1, -1), (-1, 1), (1, 1)):
+        board.line(cx, cy, cx + dx * arm, cy + dy * arm, rgb, 3)
+        board.circle(cx + dx * arm, cy + dy * arm, size // 8, rgb, 2)
+        board.line(cx + dx * arm - size // 8, cy + dy * arm,
+                   cx + dx * arm + size // 8, cy + dy * arm, rgb, 2)
+
+
+def motif_globe(board, x, y, size, rgb):
+    """A globe with a crack through it, for the collapsed climate talks."""
+    cx, cy = x + size // 2, y + size // 2
+    r = size // 2 - 4
+    board.circle(cx, cy, r, rgb, 3)
+    board.hline(cx - r, cx + r, cy - r // 2, rgb, 2)
+    board.hline(cx - r, cx + r, cy + r // 2, rgb, 2)
+    board.vline(cx, cy - r, cy + r, rgb, 2)
+    # Crack: a zig-zag from the top of the globe to the bottom.
+    board.line(cx - r // 3, cy - r, cx, cy - r // 3, rgb, 3)
+    board.line(cx, cy - r // 3, cx - r // 4, cy + r // 4, rgb, 3)
+    board.line(cx - r // 4, cy + r // 4, cx + r // 3, cy + r, rgb, 3)
+
+
+def motif_ship(board, x, y, size, rgb):
+    """A cargo ship with smoke and a flame above its hold."""
+    base = y + size * 3 // 4
+    board.line(x + 4, base, x + size - 4, base, rgb, 3)
+    board.line(x + 4, base, x + size // 4, base - size // 4, rgb, 3)
+    board.line(x + size // 4, base - size // 4, x + size * 3 // 4,
+               base - size // 4, rgb, 3)
+    board.line(x + size * 3 // 4, base - size // 4, x + size - 4, base,
+               rgb, 3)
+    board.line(x + size // 3, base - size // 4, x + size // 3,
+               base - size // 2, rgb, 3)
+    board.line(x + size // 2, base - size // 4, x + size // 2,
+               base - size // 2, rgb, 3)
+    # Flame licking from the middle hold.
+    fx = x + size * 2 // 5
+    board.line(fx, base - size // 2, fx + size // 12, base - size * 2 // 3,
+               rgb, 3)
+    board.line(fx + size // 12, base - size * 2 // 3, fx + size // 6,
+               base - size // 2, rgb, 3)
+    # Waves under the hull.
+    for k in range(3):
+        wx = x + 6 + k * size // 3
+        board.line(wx, base + 8, wx + size // 12, base + 12, rgb, 2)
+        board.line(wx + size // 12, base + 12, wx + size // 6, base + 8,
+                   rgb, 2)
+
+
+def motif_exam(board, x, y, size, rgb):
+    """An exam sheet with a pen and a big tick."""
+    board.frame(x + size // 5, y + size // 8, size * 3 // 5, size * 3 // 4,
+                rgb, 2)
+    for k in range(3):
+        ly = y + size // 4 + k * size // 8
+        board.hline(x + size // 4, x + size * 3 // 4 - 4, ly, rgb, 2)
+    board.line(x + size * 3 // 4, y + size // 8, x + size - 6,
+               y + size * 3 // 5, rgb, 3)
+    board.line(x + size - 6, y + size * 3 // 5, x + size * 3 // 4,
+               y + size * 5 // 8, rgb, 3)
+    board.line(x + size // 4, y + size * 5 // 8, x + size // 2,
+               y + size * 3 // 4, rgb, 3)
+    board.line(x + size // 2, y + size * 3 // 4, x + size * 3 // 4,
+               y + size // 2, rgb, 3)
+
+
+def motif_flags(board, x, y, size, rgb):
+    """Two flags on crossed poles, for the Nepal-India talks."""
+    board.line(x + size // 4, y + 4, x + size // 4, y + size - 4, rgb, 3)
+    board.line(x + size * 3 // 4, y + 4, x + size * 3 // 4, y + size - 4,
+               rgb, 3)
+    board.line(x + size // 4, y + 6, x + size // 2, y + size // 4, rgb, 2)
+    board.line(x + size // 2, y + size // 4, x + size // 4, y + size // 2,
+               rgb, 2)
+    board.line(x + size * 3 // 4, y + 6, x + size // 2, y + size // 4,
+               rgb, 2)
+    board.line(x + size // 2, y + size // 4, x + size * 3 // 4,
+               y + size // 2, rgb, 2)
+    board.line(x + size // 4, y + size * 5 // 8, x + size // 2,
+               y + size * 3 // 4, rgb, 3)
+    board.line(x + size // 2, y + size * 3 // 4, x + size * 3 // 4,
+               y + size * 5 // 8, rgb, 3)
+
+
+def motif_factory(board, x, y, size, rgb):
+    """A factory with a sawtooth roof, a chimney and smoke."""
+    base = y + size * 3 // 4
+    board.line(x + 4, base, x + size - 4, base, rgb, 3)
+    board.line(x + 4, base, x + 4, base - size // 3, rgb, 3)
+    board.line(x + 4, base - size // 3, x + size // 3, base - size // 2,
+               rgb, 3)
+    board.line(x + size // 3, base - size // 2, x + size // 3,
+               base - size // 3, rgb, 3)
+    board.line(x + size // 3, base - size // 3, x + size * 2 // 3,
+               base - size // 2, rgb, 3)
+    board.line(x + size * 2 // 3, base - size // 2, x + size * 2 // 3,
+               base - size // 3, rgb, 3)
+    board.line(x + size * 2 // 3, base - size // 3, x + size - 4,
+               base - size // 2, rgb, 3)
+    board.line(x + size - 4, base - size // 2, x + size - 4, base, rgb, 3)
+    # Chimney and smoke puffs.
+    chx = x + size * 5 // 6
+    board.line(chx, base - size // 2, chx, base - size * 3 // 4, rgb, 3)
+    board.line(chx + 8, base - size // 2, chx + 8, base - size * 3 // 4,
+               rgb, 3)
+    board.circle(chx + 4, y + size // 8, size // 12, rgb, 2)
+    board.circle(chx - 4, y + size // 5, size // 14, rgb, 2)
+
+
+MOTIFS = {
+    "burst": motif_burst,
+    "drone": motif_drone,
+    "globe": motif_globe,
+    "ship": motif_ship,
+    "exam": motif_exam,
+    "flags": motif_flags,
+    "factory": motif_factory,
 }
 
 
-# ------------------------------------------------------------- the stories
-# Researched from the day's reporting (23 Nov 2026). Wording is the
-# program's own summary; figures are the numbers the wires reported.
+# ---------------------------------------------------------------------------
+# The day's stories, researched 23 November 2026.
+# ---------------------------------------------------------------------------
+
 LEAD = {
-    "kicker": "LEAD STORY  -  THE GULF AT WAR",
-    "headline": "IRAN HITS TWO US BASES IN BAHRAIN",
-    "body": "TEHRAN SAID IT STRUCK US POSITIONS AT AL-RIFFA AND AWALI IN "
-            "REVENGE FOR US ATTACKS. BAHRAIN SAID A CIVILIAN PLANT WAS HIT "
-            "AND TWO PEOPLE WERE HURT. SAUDI ARABIA CONDEMNED THE STRIKES "
-            "AS THE WAR AROUND HORMUZ WIDENED.",
-    "icon": "explosion",
-    "accent": RED,
+    "kicker": "LEAD STORY - THE GULF",
+    "headline": "IRAN HITS US BASES IN BAHRAIN",
+    "body": ("IRGC MISSILES AND DRONES HIT US PATRIOT RADARS AT AL-RIFFA "
+             "AND AWALI. TWO INJURED AS A CIVILIAN PLANT BURNS. THE US "
+             "SAYS NO DAMAGE TO ITS FORCES."),
+    "motif": "burst",
 }
 
-STORIES = [
+TILES = [
     {
-        "kicker": "UKRAINE  -  WAR IN EUROPE",
-        "headline": "RUSSIAN DRONE HITS FLATS NEAR KYIV, 14 MISSING",
-        "body": "A DRONE STRUCK A HOME IN THE KYIV REGION. PRESIDENT "
-                "ZELENSKIY SAID AT LEAST 14 PEOPLE WERE MISSING.",
-        "icon": "rocket",
-        "accent": MAROON,
+        "tag": "UKRAINE",
+        "headline": "DRONE HITS FLATS NEAR KYIV - 14 MISSING",
+        "body": ("A RUSSIAN DRONE STRUCK A FIVE-STOREY BLOCK IN DYMER, "
+                 "NORTH OF KYIV. RESCUERS SEARCH THE RUBBLE FOR 14 "
+                 "PEOPLE STILL UNACCOUNTED FOR."),
+        "motif": "drone",
     },
     {
-        "kicker": "CLIMATE  -  ANTALYA",
-        "headline": "COP31 COLLAPSES WITH NO FOSSIL-FUEL DEAL",
-        "body": "TALKS IN TURKIYE ENDED WITHOUT AGREEMENT AFTER THE FINAL "
-                "DRAFT DROPPED ANY MENTION OF FOSSIL FUELS.",
-        "icon": "leaf",
-        "accent": GREEN,
+        "tag": "CLIMATE",
+        "headline": "COP31 ENDS WITH NO DEAL ON FOSSIL FUELS",
+        "body": ("THE ANTALYA SUMMIT CLOSED TWO DAYS LATE WITH NO "
+                 "AGREEMENT AFTER THE EU REJECTED A DRAFT THAT NEVER "
+                 "MENTIONED FOSSIL FUELS."),
+        "motif": "globe",
     },
     {
-        "kicker": "THE BALTIC  -  FINLAND",
-        "headline": "RUSSIAN CARGO SHIP STILL BURNING OFF FINLAND",
-        "body": "A RUSSIAN CARGO SHIP REMAINED ON FIRE OFF FINLAND AFTER AN "
-                "ATTACK. WARSAW SAID THREE MISSILES CAME DOWN ON FRIDAY.",
-        "icon": "globe",
-        "accent": NAVY_LT,
+        "tag": "BALTIC SEA",
+        "headline": "DRONE-HIT RUSSIAN SHIP BURNS OFF FINLAND",
+        "body": ("THE SANCTIONED CARGO SHIP SPARTA II CAUGHT FIRE AFTER "
+                 "A DRONE STRIKE IN THE GULF OF FINLAND AND DRIFTED "
+                 "INTO FINNISH WATERS."),
+        "motif": "ship",
     },
     {
-        "kicker": "SEOUL  -  EDUCATION",
-        "headline": "KOREA MINISTER QUITS OVER AI EXAM CHEATING",
-        "body": "SOUTH KOREA'S EDUCATION MINISTER RESIGNED AMID A CHEATING "
-                "SCANDAL IN WHICH AI WAS USED IN EXAMS.",
-        "icon": "badge",
-        "accent": SLATE,
+        "tag": "SEOUL",
+        "headline": "MINISTER QUITS OVER AI EXAM CHEATING",
+        "body": ("EDUCATION MINISTER CHOI KYO-JIN RESIGNED AFTER A TOP "
+                 "SCORER CONFESSED TO CHEATING WITH A HIDDEN CAMERA AND "
+                 "AI. 111 CASES FOUND AT THE SUNEUNG."),
+        "motif": "exam",
     },
     {
-        "kicker": "DIPLOMACY  -  NEW DELHI",
-        "headline": "NEPAL PM HOLDS TALKS WITH MODI IN DELHI",
-        "body": "NEPAL'S PRIME MINISTER BALENDRA SHAH MET NARENDRA MODI ON "
-                "A TWO-DAY STATE VISIT.",
-        "icon": "scales",
-        "accent": TEAL,
+        "tag": "SOUTH ASIA",
+        "headline": "NEPAL PM SHAH MEETS MODI IN DELHI",
+        "body": ("NEPAL PM BALENDRA SHAH HELD BILATERAL TALKS WITH PM "
+                 "MODI ON HIS FIRST VISIT TO INDIA SINCE TAKING OFFICE "
+                 "IN MARCH."),
+        "motif": "flags",
     },
     {
-        "kicker": "INDONESIA  -  DISASTER",
-        "headline": "FACTORY FIRE: 7 DEAD, 50 MISSING",
-        "body": "SEVEN BODY BAGS WERE RECOVERED AFTER A FACTORY FIRE IN "
-                "INDONESIA, WITH ABOUT 50 PEOPLE STILL MISSING.",
-        "icon": "chart",
-        "accent": BROWN,
+        "tag": "INDONESIA",
+        "headline": "FACTORY FIRE - 7 DEAD, 50 MISSING",
+        "body": ("FIRE SWEPT THE PT FONUSA AGUNG MULIA CANDY FACTORY IN "
+                 "BANTEN. SEVEN BODIES RECOVERED, 50 WORKERS STILL "
+                 "MISSING."),
+        "motif": "factory",
     },
 ]
 
-TICKER = ("LISBON MARCH OVER COSTS * FBI DATABASE HACKED * BOLSONARO "
-          "IN ICU * INDIA 720/9D")
+TICKER = ("LISBON MARCHES OVER LIVING COSTS * FBI DATABASE HACKED * "
+          "BOLSONARO IN ICU * INDIA 720/9D IN WELLINGTON")
+
+FOOTER = "ALL STORIES REPORTED ON 23 NOVEMBER 2026 - DRAWN ENTIRELY IN CODE"
 
 
-# ----------------------------------------------------------------- layout
-def draw_masthead(cv):
-    cv.rect(0, 0, W, 132, NAVY)
-    cv.rect(0, 132, W, 4, GOLD)
-    cv.text_center(W // 2, 18, "THE WORLD IN ONE PAGE", WHITE, 6)
-    cv.text_center(W // 2, 76, "MONDAY  -  23 NOVEMBER 2026", GOLD, 3)
-    cv.text_center(W // 2, 104, "THE DAY'S WORLD NEWS, IN ONE IMAGE", WHITE, 2)
+# ---------------------------------------------------------------------------
+# Page layout. Everything is placed from measured text widths, never from
+# guesses: a line is drawn only after wrap_text has said it fits.
+# ---------------------------------------------------------------------------
+
+MARGIN = 40
+CONTENT_W = WIDTH - 2 * MARGIN
 
 
-def draw_lead(cv, x, y, w, h):
-    cv.frame(x, y, w, h, INK, 3)
-    cv.rect(x + 3, y + 3, w - 6, 34, RED)
-    cv.text(x + 16, y + 12, LEAD["kicker"], WHITE, 2)
-    icon = ICONS[LEAD["icon"]]
-    box = 148
-    ix, iy = x + w - box - 18, y + 52
-    cv.rect(ix - 6, iy - 6, box + 12, box + 12, PAPER)
-    cv.frame(ix - 6, iy - 6, box + 12, box + 12, LINE, 2)
-    icon(cv, ix, iy, box, LEAD["accent"], GOLD)
-    tx = x + 16
-    tw = w - box - 16 - 32
-    lines = cv.wrap(LEAD["headline"], tw, 4)
-    yy = y + 52
-    for ln in lines[:2]:
-        cv.text(tx, yy, ln, INK, 4)
-        yy += 7 * 4 + 8
-    cv.hline(tx, yy + 2, tw, RED, 4)
-    cv.para(tx, yy + 14, LEAD["body"], INK, tw, 2, 5, max_lines=4)
+def draw_masthead(board):
+    draw_centred(board, WIDTH // 2, 44, "THE WORLD IN ONE IMAGE", 5, INK)
+    board.hline(MARGIN, WIDTH - MARGIN, 112, INK, 3)
+    draw_centred(board, WIDTH // 2, 122,
+                 "MONDAY - 23 NOVEMBER 2026 - WORLD EDITION", 2, INK)
+    board.hline(MARGIN, WIDTH - MARGIN, 152, INK, 2)
+    board.hline(MARGIN, WIDTH - MARGIN, 157, INK, 1)
 
 
-def draw_story(cv, x, y, w, h, story):
-    cv.frame(x, y, w, h, INK, 2)
-    cv.rect(x + 2, y + 2, w - 4, 26, story["accent"])
-    cv.text(x + 12, y + 9, story["kicker"], WHITE, 2)
-    lines = cv.wrap(story["headline"], w - 24, 3)
-    yy = y + 36
-    for ln in lines[:2]:
-        cv.text(x + 12, yy, ln, INK, 3)
-        yy += 7 * 3 + 5
-    icon = ICONS[story["icon"]]
-    box = 84
-    ix, iy = x + w - box - 12, y + 96
-    icon(cv, ix, iy, box, story["accent"], GOLD)
-    cv.para(x + 12, y + 98, story["body"], INK, w - box - 36, 2, 4,
-            max_lines=4)
+def draw_lead(board):
+    top = 172
+    draw_text(board, MARGIN, top, LEAD["kicker"], 2, RED)
+    head_lines = wrap_text(LEAD["headline"], 4, 660)
+    y = top + 30
+    for line in head_lines:
+        draw_text(board, MARGIN, y, line, 4, INK)
+        y += 48
+    body_lines = wrap_text(LEAD["body"], 2, 660)
+    y += 6
+    for line in body_lines:
+        draw_text(board, MARGIN, y, line, 2, INK)
+        y += 26
+    MOTIFS[LEAD["motif"]](board, 760, top + 6, 190, RED)
+    board.hline(MARGIN, WIDTH - MARGIN, 428, INK, 2)
 
 
-def draw_footer(cv, y):
-    cv.rect(0, y, W, 52, NAVY)
-    cv.text_center(W // 2, y + 10, TICKER, GOLD, 2)
-    cv.text_center(W // 2, y + 30, "23 NOVEMBER 2026  -  DRAWN FROM THE DAY'S REPORTING",
-                   WHITE, 2)
+def draw_tile(board, tile, x, y, w, h):
+    board.frame(x, y, w, h, INK, 1)
+    motif_size = 64
+    mx = x + w - motif_size - 12
+    my = y + 10
+    MOTIFS[tile["motif"]](board, mx, my, motif_size, BLUE)
+    head_w = w - motif_size - 30
+    draw_text(board, x + 12, y + 10, tile["tag"], 1, RED)
+    head_lines = wrap_text(tile["headline"], 2, head_w)
+    ty = y + 30
+    for line in head_lines[:2]:
+        draw_text(board, x + 12, ty, line, 2, INK)
+        ty += 26
+    body_lines = wrap_text(tile["body"], 1, w - 24)
+    by = y + 88
+    for line in body_lines[:4]:
+        draw_text(board, x + 12, by, line, 1, INK)
+        by += 14
 
 
-def build():
-    cv = Canvas(W, H, PAPER)
-    cv.rect(0, 0, W, H, PAPER)
-    draw_masthead(cv)
-    draw_lead(cv, 24, 148, W - 48, 216)
-    gx, gy = 24, 376
-    cw, chh = (W - 48 - 16) // 2, 188
-    for i, story in enumerate(STORIES):
-        cx = gx + (i % 2) * (cw + 16)
-        cy = gy + (i // 2) * (chh + 12)
-        draw_story(cv, cx, cy, cw, chh, story)
-    draw_footer(cv, 972)
-    return cv
+def draw_grid(board):
+    tile_w = (CONTENT_W - 16) // 2
+    tile_h = 148
+    gap = 16
+    y = 444
+    for row in range(3):
+        for col in range(2):
+            tile = TILES[row * 2 + col]
+            x = MARGIN + col * (tile_w + gap)
+            draw_tile(board, tile, x, y, tile_w, tile_h)
+        y += tile_h + 6
+
+
+def draw_ticker(board):
+    board.fill_rect(MARGIN, 910, CONTENT_W, 66, INK)
+    draw_centred(board, WIDTH // 2, 934, TICKER, 1, PAPER)
+    draw_centred(board, WIDTH // 2, 990, FOOTER, 1, GREY)
+
+
+def compose():
+    board = Board(WIDTH, HEIGHT, PAPER)
+    board.frame(14, 14, WIDTH - 28, HEIGHT - 28, INK, 2)
+    board.frame(20, 20, WIDTH - 40, HEIGHT - 40, INK, 1)
+    draw_masthead(board)
+    draw_lead(board)
+    draw_grid(board)
+    draw_ticker(board)
+    return board
 
 
 def main():
-    out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
-    os.makedirs(out_dir, exist_ok=True)
-    path = os.path.join(out_dir, "entry.png")
-    size = write_png(path, build())
-    print(f"wrote {path} ({size} bytes, {W}x{H})")
+    board = compose()
+    data = board.png_bytes()
+    with open(OUT_PATH, "wb") as fh:
+        fh.write(data)
+    digest = hashlib.sha256(data).hexdigest()
+    print(f"wrote {OUT_PATH}: {len(data)} bytes, sha256 {digest}")
+    assert len(data) <= 1024 * 1024, "PNG over 1 MiB"
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
