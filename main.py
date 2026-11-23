@@ -5,7 +5,10 @@ Pure standard library. Deterministic: same input always yields the same
 bytes. No network, no clock, no randomness.
 
 Run:  python3 main.py
-Out:  world-news-23-nov-2026.png  (1024x1024, RGB, under 1 MiB)
+Out:  $MAKEFUN_OUTPUT_DIR/entry.png (or /output/entry.png by default),
+     1024x1024, RGB, under 1 MiB. The grader runs the program with the
+     repository mounted read-only, so the image must go to the output
+     directory, never to the working directory.
 
 Design, in brief: a scanline Board (one bytearray per row) is painted with
 a small set of raster primitives (rectangles, Bresenham strokes, midpoint
@@ -16,13 +19,14 @@ measures text before it places it, so nothing can overflow the page.
 """
 
 import hashlib
+import os
 import struct
 import sys
 import zlib
 
 WIDTH = 1024
 HEIGHT = 1024
-OUT_PATH = "world-news-23-nov-2026.png"
+OUT_PATH = os.path.join(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"), "entry.png")
 
 # Palette: warm newsprint paper, near-black ink, signal red, deep blue.
 PAPER = (250, 246, 238)
